@@ -977,7 +977,7 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        choices=["p1", "p3"],
+        choices=[m.value for m in Model],
         default="p3",
         help="Camera model (default: p3)",
     )

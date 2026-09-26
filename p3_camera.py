@@ -75,6 +75,7 @@ class Model(str, Enum):
 
     P1 = "p1"  # 160×120 resolution, PID=0x45C2
     P3 = "p3"  # 256×192 resolution, PID=0x45A2
+    TS2 = "ts2"  # Vantrue TS2: P3 hardware, PID=0x45F2
 
 
 @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
@@ -138,7 +139,7 @@ def get_model_config(model: Model | str = Model.P3) -> ModelConfig:
     """Get configuration for a camera model.
 
     Args:
-        model: Camera model (P1 or P3).
+        model: Camera model (P1, P3 or TS2).
 
     Returns:
         Model configuration.
@@ -153,15 +154,17 @@ def get_model_config(model: Model | str = Model.P3) -> ModelConfig:
             shutter_seg_1_lines=36,
             shutter_seg_2_lines=800
         )
-    else:  # P3
-        return ModelConfig(
-            model=Model.P3,
-            pid=0x45A2,
-            sensor_w=256,
-            sensor_h=192,  # 192 IR + 2 metadata + 192 thermal = 386 rows
-            shutter_seg_1_lines=36,
-            shutter_seg_2_lines=800
-        )
+    p3 = ModelConfig(
+        model=Model.P3,
+        pid=0x45A2,
+        sensor_w=256,
+        sensor_h=192,  # 192 IR + 2 metadata + 192 thermal = 386 rows
+        shutter_seg_1_lines=36,
+        shutter_seg_2_lines=800
+    )
+    if model == Model.TS2:
+        return dataclasses.replace(p3, model=Model.TS2, pid=0x45F2)
+    return p3
 
 
 # Default model config
@@ -428,6 +431,35 @@ def parse_marker(data: bytes | array.array[int] | memoryview) -> np.ndarray:
     return np.frombuffer(data, dtype=MARKER_DTYPE)
 
 
+def extract_full_frame(
+    frame_data: bytes,
+    config: ModelConfig | None = None,
+) -> NDArray[np.uint16] | None:
+    """Extract the complete pixel buffer from raw frame data.
+
+    Rows [0, ir_row_end) are IR brightness, [ir_row_end, thermal_row_start) are
+    metadata, [thermal_row_start, thermal_row_end) are temperature.
+
+    Args:
+        frame_data: Raw USB frame data (with start marker).
+        config: Model configuration (defaults to P3).
+
+    Returns:
+        Read-only (frame_rows, sensor_w) uint16 view of frame_data, or None if
+        frame_data is too short.
+    """
+    if config is None:
+        config = _DEFAULT_CONFIG
+    if len(frame_data) < MARKER_SIZE + config.frame_size:
+        return None
+
+    pixels = np.frombuffer(
+        frame_data[MARKER_SIZE : MARKER_SIZE + config.frame_size],
+        dtype="<u2",
+    )
+    return pixels.reshape((config.frame_rows, config.sensor_w))
+
+
 def extract_thermal_data(
     frame_data: bytes,
     config: ModelConfig | None = None,
@@ -441,20 +473,7 @@ def extract_thermal_data(
     Returns:
         Temperature image as uint16 array, or None if invalid.
     """
-    if config is None:
-        config = _DEFAULT_CONFIG
-    expected_size = MARKER_SIZE + config.frame_size
-    if len(frame_data) < expected_size:
-        return None
-
-    pixels = np.frombuffer(
-        frame_data[MARKER_SIZE : MARKER_SIZE + config.frame_size],
-        dtype="<u2",
-    )
-    full_frame = pixels.reshape((config.frame_rows, config.sensor_w))
-
-    # Extract thermal region
-    thermal = full_frame[config.thermal_row_start : config.thermal_row_end, :].copy()
+    _, thermal = extract_both(frame_data, config)
     return thermal
 
 
@@ -474,21 +493,7 @@ def extract_ir_brightness(
     Returns:
         IR brightness image as uint8 array, or None if invalid.
     """
-    if config is None:
-        config = _DEFAULT_CONFIG
-    expected_size = MARKER_SIZE + config.frame_size
-    if len(frame_data) < expected_size:
-        return None
-
-    pixels = np.frombuffer(
-        frame_data[MARKER_SIZE : MARKER_SIZE + config.frame_size],
-        dtype="<u2",
-    )
-    full_frame = pixels.reshape((config.frame_rows, config.sensor_w))
-
-    # Extract IR brightness region (low byte contains 8-bit brightness)
-    ir_16bit = full_frame[: config.ir_row_end, :].copy()
-    ir_8bit = (ir_16bit & 0xFF).astype(np.uint8)
+    ir_8bit, _ = extract_both(frame_data, config)
     return ir_8bit
 
 
@@ -507,19 +512,12 @@ def extract_both(
     """
     if config is None:
         config = _DEFAULT_CONFIG
-    expected_size = MARKER_SIZE + config.frame_size
-    if len(frame_data) < expected_size:
+    full_frame = extract_full_frame(frame_data, config)
+    if full_frame is None:
         return None, None
 
-    pixels = np.frombuffer(
-        frame_data[MARKER_SIZE : MARKER_SIZE + config.frame_size],
-        dtype="<u2",
-    )
-    full_frame = pixels.reshape((config.frame_rows, config.sensor_w))
-
     # IR brightness (low byte)
-    ir_16bit = full_frame[: config.ir_row_end, :].copy()
-    ir_8bit = (ir_16bit & 0xFF).astype(np.uint8)
+    ir_8bit = (full_frame[: config.ir_row_end, :] & 0xFF).astype(np.uint8)
 
     # Temperature
     thermal = full_frame[config.thermal_row_start : config.thermal_row_end, :].copy()

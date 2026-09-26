@@ -30,6 +30,7 @@ from p3_camera import (
     celsius_to_raw,
     crc16_ccitt,
     extract_both,
+    extract_full_frame,
     extract_ir_brightness,
     extract_thermal_data,
     get_model_config,
@@ -95,6 +96,16 @@ class TestConstants:
         assert config.ir_row_end == 192
         assert config.thermal_row_start == 194
         assert config.thermal_row_end == 386
+
+    def test_ts2_model_config(self):
+        """Test TS2 shares P3 geometry under its own PID."""
+        config = get_model_config(Model.TS2)
+        p3 = get_model_config(Model.P3)
+        assert config.model == Model.TS2
+        assert config.pid == 0x45F2
+        assert config.sensor_w == p3.sensor_w
+        assert config.sensor_h == p3.sensor_h
+        assert config.frame_size == p3.frame_size
 
     def test_model_config_from_string(self):
         """Test model config can be created from string."""
@@ -299,6 +310,27 @@ class TestFrameParsing:
         )
         marker = parse_marker(marker_bytes)
         assert marker["cnt3"][0] == CNT3_WRAP
+
+    def test_extract_full_frame_regions(self):
+        """Test full frame keeps IR, metadata and thermal rows in place."""
+        config = get_model_config(Model.P3)
+        data = bytearray(MARKER_SIZE + config.frame_size)
+
+        pixels = np.zeros((config.frame_rows, config.sensor_w), dtype=np.uint16)
+        pixels[: config.ir_row_end, :] = 0x1234
+        pixels[config.ir_row_end : config.thermal_row_start, :] = 0xABCD
+        pixels[config.thermal_row_start :, :] = 20000
+        data[MARKER_SIZE:] = pixels.tobytes()
+
+        full = extract_full_frame(bytes(data), config=config)
+
+        assert full is not None
+        assert full.shape == (386, 256)
+        assert full[config.ir_row_end - 1, 0] == 0x1234
+        assert full[config.ir_row_end, 0] == 0xABCD
+        assert full[config.thermal_row_start - 1, -1] == 0xABCD
+        assert full[config.thermal_row_start, 0] == 20000
+        assert extract_full_frame(bytes(data[:-1]), config=config) is None
 
     def test_extract_thermal_data_valid_p3(self):
         """Test thermal data extraction for P3 model."""
