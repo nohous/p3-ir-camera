@@ -31,6 +31,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+vendor = [
+    "pyelftools>=0.31",
+    "unicorn>=2.1",
+]
 dev = [
     "basedpyright>=1.10",
     "pytest>=7.0",

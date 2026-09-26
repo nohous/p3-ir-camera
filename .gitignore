@@ -26,3 +26,5 @@ venv/
 .ruff_cache/
 *.png
 *.npy
+vendor/
+captures/

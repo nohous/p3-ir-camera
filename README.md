@@ -21,6 +21,44 @@ Images courtesy of [jvdillon](https://github.com/jvdillon) and
 > Protocol details were determined through USB traffic analysis and
 > experimentation.
 
+## This fork: Vantrue TS2
+
+This is a fork of [jvdillon/p3-ir-camera](https://github.com/jvdillon/p3-ir-camera)
+that adds the Vantrue TS2 (VID=0x3474, PID=0x45F2, 256x192), which is P3 hardware
+under its own PID. Changes from upstream:
+
+- `Model.TS2` (`--model ts2` in the viewer) and `extract_full_frame()`.
+- The command earlier named `start_stream` reads the gain; it is now `gain_get`,
+  and `P3Camera.get_gain_mode()` returns the gain. See P3_PROTOCOL.md.
+- `ts2_raw_viewer.py`: unprocessed view of the IR and temperature rows with a
+  per-pixel readout of the raw value, the camera's conversion and the value the
+  Vantrue Thermal app would display. Keys are listed in its header.
+- `vendor_tempcorr.py`: runs the app's native temperature correction under
+  Unicorn. P3_PROTOCOL.md describes the app's temperature chain.
+
+```bash
+pip install -e .[vendor]
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="3474", ATTR{idProduct}=="45f2", MODE="0666"' \
+    | sudo tee /etc/udev/rules.d/99-ts2-ir.rules
+python ts2_raw_viewer.py
+```
+
+### Vendor files
+
+The app column of `ts2_raw_viewer.py` and the vendor tests need the correction
+library and tau tables from the Vantrue Thermal Android app (package
+`com.ydzy.ts`). This repository does not ship them. With the app installed on a
+phone:
+
+```bash
+adb shell pm path com.ydzy.ts   # lists base.apk and split_config.arm64_v8a.apk
+adb pull <path>/base.apk
+adb pull <path>/split_config.arm64_v8a.apk
+mkdir -p vendor
+unzip -j base.apk 'assets/rs300_tau/V303_P3_4.3mm_*.bin' -d vendor
+unzip -j split_config.arm64_v8a.apk lib/arm64-v8a/libadvirtempac020.so -d vendor
+```
+
 ## Features
 
 - USB driver for frame capture and device control
