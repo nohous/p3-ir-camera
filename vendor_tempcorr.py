@@ -15,10 +15,15 @@ import pathlib
 import struct
 from decimal import ROUND_FLOOR, Decimal
 
-import unicorn as uc
-from elftools.elf.elffile import ELFFile
-from elftools.elf.relocation import RelocationSection
-from unicorn import arm64_const as a64
+try:
+    import unicorn as uc
+    from elftools.elf.elffile import ELFFile
+    from elftools.elf.relocation import RelocationSection
+    from unicorn import arm64_const as a64
+except ImportError:
+    # Without the 'vendor' extra the constants and app_display_c stay importable;
+    # VendorTempCorrection() raises ImportError.
+    uc = None
 
 VENDOR_DIR = pathlib.Path(__file__).parent / "vendor"
 SO_PATH = VENDOR_DIR / "libadvirtempac020.so"
@@ -58,6 +63,8 @@ class VendorTempCorrection:
     """
 
     def __init__(self, so_path=SO_PATH):
+        if uc is None:
+            raise ImportError("vendor correction needs the 'vendor' extra (unicorn, pyelftools)")
         self.mu = uc.Uc(uc.UC_ARCH_ARM64, uc.UC_MODE_ARM)
         self.stub_names = []
         self.heap_top = HEAP

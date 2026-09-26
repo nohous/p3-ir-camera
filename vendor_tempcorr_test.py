@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-vt = pytest.importorskip("vendor_tempcorr")
+pytest.importorskip("unicorn")
+pytest.importorskip("elftools")
+import vendor_tempcorr as vt  # noqa: E402
 
 if not (vt.SO_PATH.exists() and all((vt.TABLE_DIR / name).exists() for name in vt.TABLES.values())):
     pytest.skip("vendor library or tau tables missing from vendor/", allow_module_level=True)

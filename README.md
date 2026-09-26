@@ -37,11 +37,14 @@ under its own PID. Changes from upstream:
   Unicorn. P3_PROTOCOL.md describes the app's temperature chain.
 
 ```bash
-pip install -e .[vendor]
+uv sync --extra vendor     # or: pip install -e .[vendor]
 echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="3474", ATTR{idProduct}=="45f2", MODE="0666"' \
     | sudo tee /etc/udev/rules.d/99-ts2-ir.rules
-python ts2_raw_viewer.py
+uv run --extra vendor ts2_raw_viewer.py
 ```
+
+Without the `vendor` extra or the vendor files the viewer runs with its app
+column showing n/a.
 
 ### Vendor files
 

@@ -76,7 +76,7 @@ def main():
     cfg = p3.get_model_config(p3.Model.TS2)
     try:
         vc, tables = vt.VendorTempCorrection(), vt.load_tables()
-    except OSError as e:
+    except (OSError, ImportError) as e:
         print(f"app column disabled: {e}")
         vc = tables = None
     params = dict(vt.APP_DEFAULTS)
