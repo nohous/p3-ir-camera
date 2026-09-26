@@ -234,8 +234,9 @@ COMMANDS: dict[str, bytes] = {
     "status": bytes.fromhex(
         "1021810000000000000000000200000095d1",
     ),
-    # Stream control (0x012f command type)
-    "start_stream": bytes.fromhex(
+    # Gain (0x012f command type). gain_get returns 1 byte: GainMode value, or
+    # 0x35 after a gain switch the camera rejected.
+    "gain_get": bytes.fromhex(
         "012f81000000000000000000010000004930",
     ),
     "gain_low": bytes.fromhex(
@@ -726,13 +727,15 @@ class P3Camera:
         """Start video streaming.
 
         Follows the sequence observed from the Windows Temp Master tool:
-        1. Send start_stream command and check status
+        1. Read gain
         2. Wait 1 second
         3. Set interface alternate setting
         4. Send 0xEE control transfer
         5. Wait 2 seconds for camera to be ready
         6. Issue async bulk read (Windows tool does this)
-        7. Send start_stream command again
+        7. Read gain again
+
+        gain_mode is updated from the camera when a gain read returns a valid mode.
         """
         if self.dev is None:
             raise RuntimeError("Not connected")
@@ -740,16 +743,7 @@ class P3Camera:
         # Reset frame statistics
         self.stats = FrameStats()
 
-        # Initial start_stream with status checks
-        self._send_command(COMMANDS["start_stream"])
-        self._read_status()  # reads 0x02
-        resp = self._read_response(1)  # reads 0x01 (or 0x35 if restarting)
-        self._read_status()  # reads 0x03
-
-        # Check for restart response (0x35 = '5' when stream was already active)
-        if resp and resp[0] == 0x35:
-            # Camera was already streaming, this is a restart
-            pass  # Continue with sequence
+        self._update_gain_mode(self._read_gain())
 
         # Wait before configuring interface (per Windows tool timing)
         time.sleep(1.0)
@@ -761,20 +755,12 @@ class P3Camera:
         # Wait for camera to be ready (Windows tool waits ~2 seconds)
         time.sleep(2.0)
 
-        # Issue async bulk read before final start_stream (per Windows tool)
+        # Issue async bulk read before the final gain read (per Windows tool)
         # This read happens asynchronously in the Windows tool
         with contextlib.suppress(Exception):
             self.dev.read(0x81, self.config.frame_size, 100)
 
-        # Final start_stream with status checks
-        self._send_command(COMMANDS["start_stream"])
-        self._read_status()
-        resp = self._read_response(1)
-        self._read_status()
-
-        # Handle restart response on final start_stream too
-        if resp and resp[0] == 0x35:
-            pass  # Camera acknowledges restart
+        self._update_gain_mode(self._read_gain())
 
         self.streaming = True
 
@@ -978,11 +964,31 @@ class P3Camera:
         else:
             return frame_data
 
+    def get_gain_mode(self) -> GainMode:
+        """Read the sensor gain mode from the camera.
+
+        Returns:
+            Current gain mode (LOW or HIGH).
+
+        Raises:
+            RuntimeError: If the camera reports anything but a gain mode, e.g.
+                0x35 after a rejected gain switch.
+        """
+        if self.dev is None:
+            raise RuntimeError("Not connected")
+        value = self._read_gain()
+        if not self._update_gain_mode(value):
+            raise RuntimeError(f"gain read returned {value:#04x}")
+        return self.gain_mode
+
     def set_gain_mode(self, mode: GainMode) -> None:
         """Set sensor gain mode.
 
         Gain commands use param 0x41 instead of 0x81 and have no response data.
-        We still follow the status ACK pattern for consistency.
+        We still follow the status ACK pattern for consistency. The switch
+        completes asynchronously: the vendor app waits 6 s before relying on the
+        new gain. A switch sent right after start_streaming is dropped by the
+        camera; stream for about 2 s first.
 
         Args:
             mode: Gain mode (LOW, HIGH, or AUTO).
@@ -997,6 +1003,21 @@ class P3Camera:
         self.gain_mode = mode
 
     # Private methods
+
+    def _read_gain(self) -> int:
+        """Send gain_get and return the raw 1-byte response."""
+        self._send_command(COMMANDS["gain_get"])
+        self._read_status()  # reads 0x02
+        value = self._read_response(1)[0]
+        self._read_status()  # reads 0x03
+        return value
+
+    def _update_gain_mode(self, value: int) -> bool:
+        """Store value as gain_mode if it is LOW or HIGH; return whether it was."""
+        if value not in (GainMode.LOW, GainMode.HIGH):
+            return False
+        self.gain_mode = GainMode(value)
+        return True
 
     def _send_command(self, cmd: bytes) -> None:
         """Send a control command to the device."""
