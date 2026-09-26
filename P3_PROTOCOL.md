@@ -11,6 +11,7 @@ Protocol documentation for P3-series USB thermal cameras.
 |-------|-----|-----|------------|------------|
 | P3 | 0x3474 | 0x45A2 | 256×192 | 197,632 bytes |
 | P1 | 0x3474 | 0x45C2 | 160×120 | 77,440 bytes |
+| TS2 (Vantrue) | 0x3474 | 0x45F2 | 256x192 | 197,632 bytes |
 
 Frame rate: ~25 fps
 
@@ -96,7 +97,7 @@ Offset  Size  Description
 Command types:
 - 0x0101: Read register
 - 0x1021: Status check
-- 0x012f: Stream control
+- 0x012f: Gain (0x81 read = gain_get, 0x41 write = gain set)
 - 0x0136: Shutter/NUC
 
 ### Register Map
@@ -121,8 +122,8 @@ COMMANDS = {
     'read_serial':      bytes.fromhex('01018100070000000000000040000000104c'),  # reg 0x07
     'read_hw_version':  bytes.fromhex('010181000a00000000000000400000001959'),  # reg 0x0a
     'read_model_long':  bytes.fromhex('010181000f0000000000000040000000b857'),  # reg 0x0f
-    # Stream control
-    'start_stream':     bytes.fromhex('012f81000000000000000000010000004930'),
+    # Gain
+    'gain_get':         bytes.fromhex('012f81000000000000000000010000004930'),
     'gain_low':         bytes.fromhex('012f41000000000000000000000000003c3a'),
     'gain_high':        bytes.fromhex('012f41000100000000000000000000004939'),
     # Shutter
@@ -146,10 +147,10 @@ dev.ctrl_transfer(0xC1, 0x22, 0, 0, 1)  # status
 name = dev.ctrl_transfer(0xC1, 0x21, 0, 0, 30)
 dev.ctrl_transfer(0xC1, 0x22, 0, 0, 1)  # status
 
-# 3. Initial start streaming command
-dev.ctrl_transfer(0x41, 0x20, 0, 0, COMMANDS['start_stream'])
+# 3. Read gain (the Windows tool does this before starting)
+dev.ctrl_transfer(0x41, 0x20, 0, 0, COMMANDS['gain_get'])
 dev.ctrl_transfer(0xC1, 0x22, 0, 0, 1)  # reads 0x02
-resp = dev.ctrl_transfer(0xC1, 0x21, 0, 0, 1)  # reads 0x01 (or 0x35 if restarting)
+resp = dev.ctrl_transfer(0xC1, 0x21, 0, 0, 1)  # gain mode, see gain_get Response Values
 dev.ctrl_transfer(0xC1, 0x22, 0, 0, 1)  # reads 0x03
 
 # 4. Wait before configuring interface
@@ -168,20 +169,21 @@ try:
 except:
     pass  # Expected to timeout
 
-# 8. Final start stream
-dev.ctrl_transfer(0x41, 0x20, 0, 0, COMMANDS['start_stream'])
+# 8. Read gain again
+dev.ctrl_transfer(0x41, 0x20, 0, 0, COMMANDS['gain_get'])
 dev.ctrl_transfer(0xC1, 0x22, 0, 0, 1)
-resp = dev.ctrl_transfer(0xC1, 0x21, 0, 0, 1)  # reads 0x01 or 0x35
+resp = dev.ctrl_transfer(0xC1, 0x21, 0, 0, 1)  # gain mode
 dev.ctrl_transfer(0xC1, 0x22, 0, 0, 1)
 ```
 
-### start_stream Response Values
+### gain_get Response Values
 
-The `start_stream` command returns a 1-byte response:
-- `0x01`: Normal start (camera was idle)
-- `0x35` ('5'): Restart (camera was already streaming)
-
-The 0x35 response indicates the stream is being restarted rather than started fresh.
+This command was called start_stream in earlier versions of this document. The
+vendor SDK (libircmd, basic_gain_get) sends the same bytes to read the gain, and
+the camera's debug log records it as `std cmd: in : 1 2f 81`. It returns 1 byte:
+- `0x00`: low gain
+- `0x01`: high gain
+- `0x35`: error state after a gain switch the camera rejected (debug log: `switch error`)
 
 ## Stop Streaming
 
@@ -292,10 +294,42 @@ def celsius_to_raw(celsius):
     return int((celsius + 273.15) * SCALE)
 ```
 
+## Vendor Temperature Correction (TS2)
+
+Read in the Vantrue Thermal Android app (com.ydzy.ts 0.0.9), which drives the TS2
+through the InfiRay AC020 SDK:
+
+1. Each temperature-row pixel is converted with raw / 64 - 273.15 (LibIRTemp,
+   scale 64). Spot readings use integer division first, so the app's spot values
+   are whole kelvins minus 273.15 and always end in .85 C; line, rectangle and
+   circle min/max/average keep the 1/64 K resolution.
+2. Measurement results (not image pixels) go through
+   LibIRTempAC020.temperatureCorrection with the tau table for the current gain
+   (assets/rs300_tau/V303_P3_4.3mm_H.bin or _L.bin), emissivity, ambient and
+   reflected temperature, distance and humidity. Inputs outside -20..150 C (high
+   gain) or 0..550 C (low gain) are passed through uncorrected.
+3. The result is floored to 0.01 C.
+
+App defaults: emissivity 1.0, distance 0.25 m, ambient = reflected = 25 C,
+humidity 0.8. With these the correction returns its input unchanged.
+
+vendor_tempcorr.py runs the vendor's native correction
+(enhance_distance_temp_correct in libadvirtempac020.so) under Unicorn, and
+app_display_c() applies the rules above; ts2_raw_viewer.py shows the result next
+to the raw value.
+
 ## Gain Modes
 
 - **High gain**: -20°C to 150°C (higher sensitivity)
 - **Low gain**: 0°C to 550°C (extended range)
+
+Measured on a TS2:
+- A gain switch completes asynchronously; the vendor app waits 6 s before relying
+  on it, and the camera cycles the shutter during the switch.
+- A switch sent right after streaming starts is dropped; stream for about 2 s first.
+- In low gain a 21 C scene reads about -34 C with raw / 64 - 273.15. The vendor app
+  shows "<150 C" for any low-gain value below 150 C, so low gain is only valid for
+  hot scenes.
 
 ```python
 # Set low gain (extended range)
@@ -385,5 +419,5 @@ helps maintain sync. Use `array.array` to detect short reads.
 Trigger shutter calibration, allow camera to warm up (~5 minutes).
 
 **Stream won't start:**
-Ensure the 2-second delay after `0xEE` control transfer before final
-start_stream command.
+Ensure the 2-second delay after `0xEE` control transfer before the final
+gain read.
