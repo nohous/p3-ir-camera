@@ -30,21 +30,22 @@ under its own PID. Changes from upstream:
 - `Model.TS2` (`--model ts2` in the viewer) and `extract_full_frame()`.
 - The command earlier named `start_stream` reads the gain; it is now `gain_get`,
   and `P3Camera.get_gain_mode()` returns the gain. See P3_PROTOCOL.md.
-- `ts2_raw_viewer.py`: unprocessed view of the IR and temperature rows with a
-  per-pixel readout of the raw value, the camera's conversion and the value the
-  Vantrue Thermal app would display. Keys are listed in its header.
+- `ts2_raw_viewer.py`: the temperature rows as delivered, with a histogram of
+  every raw code over the gain's calibrated range and a draggable band that maps
+  to black..white; a gain button; a per-pixel readout of the raw value, the
+  camera's conversion and the value the Vantrue Thermal app would display.
 - `vendor_tempcorr.py`: runs the app's native temperature correction under
   Unicorn. P3_PROTOCOL.md describes the app's temperature chain.
 
 ```bash
-uv sync --extra vendor     # or: pip install -e .[vendor]
+uv sync --extra gui --extra vendor     # or: pip install -e .[gui,vendor]
 echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="3474", ATTR{idProduct}=="45f2", MODE="0666"' \
     | sudo tee /etc/udev/rules.d/99-ts2-ir.rules
-uv run --extra vendor ts2_raw_viewer.py
+uv run --extra gui --extra vendor ts2_raw_viewer.py
 ```
 
-Without the `vendor` extra or the vendor files the viewer runs with its app
-column showing n/a.
+The viewer needs the `gui` extra. Without the `vendor` extra or the vendor files
+it runs with its app column showing n/a.
 
 ### Vendor files
 

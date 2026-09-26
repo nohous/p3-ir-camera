@@ -35,6 +35,10 @@ vendor = [
     "pyelftools>=0.31",
     "unicorn>=2.1",
 ]
+gui = [
+    "pyqtgraph>=0.13",
+    "PySide6>=6.5",
+]
 dev = [
     "basedpyright>=1.10",
     "pytest>=7.0",
