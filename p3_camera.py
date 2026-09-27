@@ -563,13 +563,14 @@ def build_command(
 ) -> bytes:
     """Build an 18-byte USB command with CRC.
 
-    Command format:
+    Command format (matches the captured packets in COMMANDS):
     - Bytes 0-1: Command type (LE)
     - Bytes 2-3: Parameter (LE)
     - Bytes 4-5: Register ID (LE)
-    - Bytes 6-13: Reserved (zeros)
-    - Bytes 14-15: Response length (LE)
-    - Bytes 16-17: CRC16 (LE)
+    - Bytes 6-11: Reserved (zeros)
+    - Bytes 12-13: Response length (LE)
+    - Bytes 14-15: Reserved (zeros)
+    - Bytes 16-17: CRC16 over bytes 0-15 (LE)
 
     Args:
         cmd_type: Command type (e.g., 0x0101 for read register).
@@ -582,11 +583,10 @@ def build_command(
 
     """
     payload = struct.pack(
-        "<HHHQH",
+        "<HHH6xH2x",
         cmd_type,
         param,
         register,
-        0,  # 8 bytes reserved
         resp_len,
     )
     crc = crc16_ccitt(payload)

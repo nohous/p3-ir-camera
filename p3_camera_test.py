@@ -433,8 +433,22 @@ class TestProtocol:
         assert cmd[2:4] == b"\x81\x00"
         # Check register (bytes 4-5)
         assert cmd[4:6] == b"\x06\x00"
-        # Check response length (bytes 14-15)
-        assert cmd[14:16] == b"\x40\x00"  # 64 in little-endian
+        # Check response length (bytes 12-13)
+        assert cmd[12:14] == b"\x40\x00"  # 64 in little-endian
+
+    def test_build_command_reproduces_captured_packets(self):
+        fields = {
+            "read_name": (0x0101, 0x0081, 0x01, 30),
+            "read_version": (0x0101, 0x0081, 0x02, 12),
+            "read_part_number": (0x0101, 0x0081, 0x06, 64),
+            "read_serial": (0x0101, 0x0081, 0x07, 64),
+            "read_hw_version": (0x0101, 0x0081, 0x0A, 64),
+            "read_model_long": (0x0101, 0x0081, 0x0F, 64),
+            "gain_get": (0x2F01, 0x0081, 0x00, 1),
+            "status": (0x2110, 0x0081, 0x00, 2),
+        }
+        for name, args in fields.items():
+            assert build_command(*args) == COMMANDS[name], name
 
     def test_precomputed_commands_length(self):
         for name, cmd in COMMANDS.items():
