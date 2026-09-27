@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
+from collections.abc import Sequence
 
 import array
 import contextlib
@@ -68,6 +69,11 @@ SYNC_END_ODD = 0x8F  # End marker, odd frame
 # Expected cnt3 increment per frame (~40, wraps at 2048)
 CNT3_INCREMENT = 40
 CNT3_WRAP = 2048
+
+# Status register values (vendor SDK, usb_status_check_done)
+STATUS_BUSY = 1  # Command still executing
+STATUS_READY = 2  # Read command accepted, response data available
+STATUS_DONE = 3  # Command completed
 
 
 class Model(str, Enum):
@@ -199,6 +205,19 @@ class FrameStats:
     marker_mismatches: int = 0  # Frames with cnt1 mismatch (still returned)
     last_cnt1: int = 0  # Last frame's cnt1 value
     last_cnt3: int = 0  # Last frame's cnt3 value (for drop detection)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CommandResult:
+    """Final status byte of one command and its response data."""
+
+    status: int
+    data: bytes = b""
+
+    @property
+    def ok(self) -> bool:
+        """Whether the camera completed the command."""
+        return self.status == STATUS_DONE
 
 
 # Pre-computed USB commands with CRC
@@ -593,6 +612,81 @@ def build_command(
     return payload + struct.pack("<H", crc)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class Control:
+    """One camera setting or action, decoded from the vendor SDK (libircmd).
+
+    get and set are bytes 0-3 of the command as hex; the setting value, or
+    the fixed value of an action, goes in the register field (byte 4). A
+    control with set and no values is an action.
+    """
+
+    name: str
+    group: str
+    sdk: str
+    get: str | None = None
+    get_reg: int = 0
+    get_len: int = 1
+    set: str | None = None
+    values: Sequence[int] = ()
+    action_value: int = 0
+    note: str = ""
+
+    def get_command(self) -> bytes:
+        cmd_type, param = struct.unpack("<HH", bytes.fromhex(self.get))
+        return build_command(cmd_type, param, self.get_reg, self.get_len)
+
+    def set_command(self, value: int) -> bytes:
+        cmd_type, param = struct.unpack("<HH", bytes.fromhex(self.set))
+        return build_command(cmd_type, param, value, 0)
+
+
+CONTROLS: tuple[Control, ...] = (
+    Control(name="Shutter close", group="Shutter / FFC", sdk="adv_shutter_tab_close",
+            set="010f4500", action_value=0,
+            note="Closes the shutter flap; the image becomes the uniform flap."),
+    Control(name="Shutter open", group="Shutter / FFC", sdk="adv_shutter_tab_open",
+            set="010f4500", action_value=1, note="Opens the shutter flap."),
+    Control(name="FFC now", group="Shutter / FFC", sdk="basic_ffc_update",
+            set="10024300", note="Flat-field correction against the shutter."),
+    Control(name="Manual FFC update", group="Shutter / FFC", sdk="adv_manual_ffc_update",
+            set="01364300", note="Same bytes as COMMANDS['shutter']."),
+    Control(name="FFC without shutter", group="Shutter / FFC", sdk="adv_ffc_without_shutter",
+            set="01105200", note="Takes the current scene as the uniform reference."),
+    Control(name="Auto FFC", group="Shutter / FFC", sdk="basic_auto_ffc_status_get/set",
+            get="10028100", set="10024100", values=(0, 1, 2)),
+    Control(name="Manual FFC switch / shutter status", group="Shutter / FFC",
+            sdk="adv_manual_ffc_switch_get/set, adv_shutter_status_get/set",
+            get="10028300", set="10024400", values=(0, 1), note="The two SDK names send the same bytes."),
+    Control(name="Shutter abnormal detection", group="Shutter / FFC",
+            sdk="adv_shutter_abnormal_detect_algorithm_get/set",
+            get="10049100", set="10045100", values=(0, 1),
+            note="TS2: set is acknowledged, read-back stays 1."),
+    Control(name="Overexposure protection / all FFC function", group="Protection",
+            sdk="basic_overexposure_protect_switch_get/set, basic_all_ffc_function_status_get/set",
+            get="10038d00", set="10034c00", values=(0, 1, 2),
+            note="The two SDK names send the same bytes. TS2: set 0 also switches Auto FFC off, and set 1 "
+                 "does not switch it back on; Auto FFC = 1 restores both."),
+    Control(name="Sun detection", group="Protection", sdk="basic_sun_detect_switch_get/set",
+            get="10038b00", set="10034b00", values=(0, 1)),
+    Control(name="Temporal noise reduction level", group="Image processing",
+            sdk="basic_time_noise_reduce_level_get/set", get="10048c00", get_reg=1,
+            set="10044c00", values=range(101)),
+    Control(name="Spatial noise reduction level", group="Image processing",
+            sdk="basic_space_noise_reduce_level_get/set", get="10048b00", get_reg=1,
+            set="10044b00", values=range(101)),
+    Control(name="NUC-T bypass", group="Radiometry", sdk="adv_bypass_nuct_get/set, adv_nuc_t_bypass_set",
+            get="01268800", set="01264800", values=(0, 1),
+            note="TS2: bypass on raised the output ~3 K and its pixel spread ~60%; data stays in 1/16 K steps."),
+    Control(name="Picture freeze", group="Stream", sdk="adv_picture_freeze_status_get/set",
+            get="10108200", set="10104200", values=(0, 1)),
+    Control(name="Powered time", group="Info", sdk="adv_powered_time_get", get="10109300", get_len=4),
+    Control(name="Device current status", group="Info", sdk="basic_device_current_status_get", get="01018200"),
+    Control(name="Device temperature", group="Info", sdk="basic_device_temp_get", get="10109100", get_len=2,
+            note="SDK scales the value by 1/100 C. TS2: rejected (status 4)."),
+)
+
+
 # =============================================================================
 # Camera Class (Stateful)
 # =============================================================================
@@ -651,20 +745,7 @@ class P3Camera:
         """
         if self.dev is None:
             raise RuntimeError("Not connected")
-
-        self._send_command(COMMANDS["read_name"])
-        self._read_status()  # ACK
-        name = bytes(self._read_response(30))
-        self._read_status()  # ACK
-        name_str = name.rstrip(b"\x00").decode(errors="replace")
-
-        self._send_command(COMMANDS["read_version"])
-        self._read_status()  # ACK
-        version = bytes(self._read_response(12))
-        self._read_status()  # ACK
-        version_str = version.rstrip(b"\x00").decode(errors="replace")
-
-        return name_str, version_str
+        return self.read_register("read_name", 30), self.read_register("read_version", 12)
 
     def read_register(self, cmd_name: str, length: int) -> str:
         """Read a register and return decoded string.
@@ -678,11 +759,37 @@ class P3Camera:
         """
         if self.dev is None:
             raise RuntimeError("Not connected")
-        self._send_command(COMMANDS[cmd_name])
-        self._read_status()  # ACK after write
-        data = bytes(self._read_response(length))
-        self._read_status()  # ACK after read
+        data = self.command(COMMANDS[cmd_name], length).data
         return data.rstrip(b"\x00").decode(errors="replace")
+
+    def command(self, cmd: bytes, resp_len: int = 0, timeout: float = 2.0) -> CommandResult:
+        """Send one 18-byte command and collect its final status and response.
+
+        Polls the status register while it reports STATUS_BUSY, as the vendor
+        SDK does. A read command must report STATUS_READY before its response
+        is read; any other status ends the command with no data.
+
+        Args:
+            cmd: 18-byte command, see build_command.
+            resp_len: Response length in bytes; 0 for commands without data.
+            timeout: Longest wait in seconds while the camera reports busy.
+
+        Returns:
+            Final status and response data.
+        """
+        if self.dev is None:
+            raise RuntimeError("Not connected")
+        self._send_command(cmd)
+        status = self._read_status()
+        deadline = time.monotonic() + timeout
+        while status == STATUS_BUSY and time.monotonic() < deadline:
+            time.sleep(0.001)
+            status = self._read_status()
+
+        if resp_len == 0 or status != STATUS_READY:
+            return CommandResult(status)
+        data = self._read_response(resp_len)
+        return CommandResult(self._read_status(), data)
 
     def read_device_info(self) -> dict[str, str]:
         """Read all device information registers.
@@ -978,7 +1085,7 @@ class P3Camera:
             raise RuntimeError("Not connected")
         value = self._read_gain()
         if not self._update_gain_mode(value):
-            raise RuntimeError(f"gain read returned {value:#04x}")
+            raise RuntimeError(f"gain read returned {value}")
         return self.gain_mode
 
     def set_gain_mode(self, mode: GainMode) -> None:
@@ -994,25 +1101,20 @@ class P3Camera:
             mode: Gain mode (LOW, HIGH, or AUTO).
         """
         if mode == GainMode.LOW:
-            self._send_command(COMMANDS["gain_low"])
-            self._read_status()  # ACK after write
+            self.command(COMMANDS["gain_low"])
         elif mode == GainMode.HIGH:
-            self._send_command(COMMANDS["gain_high"])
-            self._read_status()  # ACK after write
+            self.command(COMMANDS["gain_high"])
         # AUTO mode requires firmware support (not implemented in protocol)
         self.gain_mode = mode
 
     # Private methods
 
-    def _read_gain(self) -> int:
-        """Send gain_get and return the raw 1-byte response."""
-        self._send_command(COMMANDS["gain_get"])
-        self._read_status()  # reads 0x02
-        value = self._read_response(1)[0]
-        self._read_status()  # reads 0x03
-        return value
+    def _read_gain(self) -> int | None:
+        """Send gain_get and return the 1-byte response, or None if rejected."""
+        result = self.command(COMMANDS["gain_get"], 1)
+        return result.data[0] if result.ok else None
 
-    def _update_gain_mode(self, value: int) -> bool:
+    def _update_gain_mode(self, value: int | None) -> bool:
         """Store value as gain_mode if it is LOW or HIGH; return whether it was."""
         if value not in (GainMode.LOW, GainMode.HIGH):
             return False

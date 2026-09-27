@@ -318,6 +318,27 @@ vendor_tempcorr.py runs the vendor's native correction
 app_display_c() applies the rules above; ts2_raw_viewer.py shows the result next
 to the raw value.
 
+## Vendor Control Commands (TS2)
+
+`p3_camera.CONTROLS` lists the settings and actions decoded from the vendor
+command library (libircmd, AC020 SDK) and checked on a TS2. They use the
+18-byte format above: bytes 0-3 name the command, a setting's value goes in the
+register field (byte 4), and a read carries its response length.
+
+The status register tells how a command ended: 1 busy (poll again), 2 read
+command accepted and response ready, 3 done; any other value means the camera
+rejected the command (the device temperature read returns 4 on a TS2).
+
+Measured on a TS2:
+- Shutter close (`01 0f 45 00 00`) makes the image the uniform shutter flap;
+  shutter open (`01 0f 45 00 01`) restores the scene.
+- FFC now (`10 02 43 00`) and manual FFC update (`01 36 43 00`, the command
+  earlier documented as `shutter`) both log `ffc b update done`.
+- Picture freeze (`10 10 42 00 01`) repeats one frame until released.
+- Auto FFC (`10 02 41 00 v`) reads back as set. Setting the overexposure /
+  all-FFC function (`10 03 4c 00 00`) to 0 also switches auto FFC off, and
+  setting it to 1 does not switch it back on; auto FFC = 1 restores both.
+
 ## Gain Modes
 
 - **High gain**: -20°C to 150°C (higher sensitivity)
