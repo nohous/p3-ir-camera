@@ -12,6 +12,8 @@ value, the camera's 1/64 K conversion and the value the Vantrue app would
 display (vendor_tempcorr; n/a without the 'vendor' extra or the vendor files).
 
 Keys: Space pause/resume the buffer, Left/Right step one buffered frame.
+The panel on the right reads and sets the camera controls of p3_camera.CONTROLS
+and sends raw commands; every command is logged with the camera's log line.
 
 Run: uv run --extra gui --extra vendor ts2_raw_viewer.py
 """
@@ -35,25 +37,32 @@ BUFFER_FRAMES = 250
 
 class CameraThread(QtCore.QThread):
     """
-    Owns the camera. Reads frames continuously and runs queued gain switches
+    Owns the camera. Reads frames continuously and runs submitted requests
     between frames, so control transfers never overlap a bulk read.
     """
 
     frame = QtCore.Signal(bytes, int, int)
-    gain = QtCore.Signal(object, bool)
+    streaming = QtCore.Signal(object)
+    done = QtCore.Signal(object, object)
 
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.gain_requests = queue.Queue()
+        self.requests = queue.Queue()
         self.running = True
+
+    def submit(self, fn, callback=None):
+        """
+        Runs fn(camera) between frames. done carries callback and the result,
+        or the exception fn raised, to be handled in the GUI thread.
+        """
+        self.requests.put((fn, callback))
 
     def run(self):
         cam = p3.P3Camera(config=self.cfg)
         cam.connect()
         cam.start_streaming()
-        self.gain.emit(cam.gain_mode, False)
-        switch_until = 0.0
+        self.streaming.emit(cam.gain_mode)
 
         try:
             while self.running:
@@ -63,24 +72,170 @@ class CameraThread(QtCore.QThread):
                     continue
                 self.frame.emit(raw, cam.stats.frames_read, cam.stats.frames_dropped)
 
-                now = time.monotonic()
-                if switch_until and now >= switch_until:
-                    switch_until = 0.0
+                while True:
                     try:
-                        cam.get_gain_mode()
-                    except RuntimeError as e:
-                        print(f"gain read after switch: {e}")
-                    self.gain.emit(cam.gain_mode, False)
-
-                try:
-                    target = self.gain_requests.get_nowait()
-                except queue.Empty:
-                    continue
-                cam.set_gain_mode(target)
-                switch_until = now + SWITCH_WAIT_S
-                self.gain.emit(target, True)
+                        fn, callback = self.requests.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        result = fn(cam)
+                    except Exception as e:
+                        result = e
+                    if callback is not None:
+                        self.done.emit(callback, result)
         finally:
             cam.stop_streaming()
+
+
+def editor_value(editor):
+    if isinstance(editor, QtWidgets.QComboBox):
+        return int(editor.currentText())
+    return editor.value()
+
+
+class ControlPanel(QtWidgets.QWidget):
+    """
+    One row per entry of p3_camera.CONTROLS plus a raw command console. Every
+    command goes through the camera thread and is logged with the first line
+    of the camera's debug log.
+    """
+
+    EXCLUDED = ("Not in this panel (they write flash, calibration or firmware, or reboot): "
+                "*_save, *_restore, calibration (recal, k_value, dpc, rmcover, second_cali), "
+                "cfg_file_*, xmem/isp/algorithm writes, firmware_download, reset_to_rom/bootloader, "
+                "reboot/file-update modes, baudrate, frame rate.")
+
+    def __init__(self, camera):
+        super().__init__()
+        self.camera = camera
+        self.rows = {}
+        layout = QtWidgets.QVBoxLayout(self)
+
+        read_all = QtWidgets.QPushButton("Read all")
+        read_all.clicked.connect(self.read_all)
+        layout.addWidget(read_all)
+
+        groups = {}
+        for c in p3.CONTROLS:
+            if c.group not in groups:
+                box = QtWidgets.QGroupBox(c.group)
+                groups[c.group] = QtWidgets.QGridLayout(box)
+                layout.addWidget(box)
+            self._add_row(groups[c.group], c)
+
+        layout.addWidget(self._raw_console())
+
+        excluded = QtWidgets.QLabel(self.EXCLUDED)
+        excluded.setWordWrap(True)
+        layout.addWidget(excluded)
+
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(1000)
+        self.log_view.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont))
+        layout.addWidget(self.log_view, stretch=1)
+
+    def _add_row(self, grid, c):
+        r = grid.rowCount()
+        name = QtWidgets.QLabel(c.name)
+        name.setToolTip(f"{c.sdk}\n{c.note}".strip())
+        grid.addWidget(name, r, 0)
+
+        value = QtWidgets.QLabel("-")
+        grid.addWidget(value, r, 1)
+        editor = None
+        if c.values:
+            if len(c.values) <= 3:
+                editor = QtWidgets.QComboBox()
+                editor.addItems([str(v) for v in c.values])
+            else:
+                editor = QtWidgets.QSpinBox()
+                editor.setRange(min(c.values), max(c.values))
+            grid.addWidget(editor, r, 2)
+            set_button = QtWidgets.QPushButton("Set")
+            set_button.clicked.connect(lambda _=False, c=c, e=editor: self.set(c, editor_value(e)))
+            grid.addWidget(set_button, r, 3)
+        elif c.set:
+            run = QtWidgets.QPushButton("Run")
+            run.clicked.connect(lambda _=False, c=c: self.set(c, c.action_value))
+            grid.addWidget(run, r, 3)
+        if c.get:
+            read = QtWidgets.QPushButton("Read")
+            read.clicked.connect(lambda _=False, c=c: self.read(c))
+            grid.addWidget(read, r, 4)
+        self.rows[c.name] = (value, editor)
+
+    def _raw_console(self):
+        box = QtWidgets.QGroupBox("Raw command (bytes 0-3 hex, register, response length)")
+        row = QtWidgets.QHBoxLayout(box)
+        self.raw_prefix = QtWidgets.QLineEdit("10028100")
+        self.raw_reg = QtWidgets.QSpinBox()
+        self.raw_reg.setRange(0, 0xFFFF)
+        self.raw_len = QtWidgets.QSpinBox()
+        self.raw_len.setRange(0, 256)
+        self.raw_len.setValue(1)
+        send = QtWidgets.QPushButton("Send")
+        send.clicked.connect(self.send_raw)
+        for w in (self.raw_prefix, self.raw_reg, self.raw_len, send):
+            row.addWidget(w)
+        return box
+
+    # ---- commands ------------------------------------------------------------
+
+    def read_all(self):
+        for c in p3.CONTROLS:
+            if c.get:
+                self.read(c)
+
+    def read(self, c):
+        self._submit(c.name, "read", c.get_command(), c.get_len, lambda result: self._show_value(c, result))
+
+    def set(self, c, value):
+        after = (lambda result: self.read(c)) if c.get else None
+        self._submit(c.name, f"set {value}", c.set_command(value), 0, after)
+
+    def send_raw(self):
+        try:
+            c = p3.Control(name="raw", group="", sdk="", get=self.raw_prefix.text().strip(),
+                           get_reg=self.raw_reg.value(), get_len=self.raw_len.value())
+            cmd = c.get_command()
+        except (ValueError, TypeError) as e:
+            self.log(f"raw: bad input ({e})")
+            return
+        self._submit("raw", cmd.hex(), cmd, c.get_len, None)
+
+    def _submit(self, name, what, cmd, resp_len, then):
+        def fn(cam):
+            result = cam.command(cmd, resp_len)
+            lines = cam.read_debug_log(256).splitlines()
+            return result, lines[0] if lines else ""
+
+        def done(outcome):
+            if isinstance(outcome, Exception):
+                self.log(f"{name}: {what} failed: {outcome}")
+                return
+            result, camera_log = outcome
+            data = f" data {result.data.hex()}" if result.data else ""
+            self.log(f"{name}: {what} -> status {result.status}{data} | camera: {camera_log}")
+            if then is not None:
+                then(result)
+
+        self.camera.submit(fn, done)
+
+    def _show_value(self, c, result):
+        value, editor = self.rows[c.name]
+        if not result.ok:
+            value.setText(f"rejected ({result.status})")
+            return
+        v = int.from_bytes(result.data, "little")
+        value.setText(str(v))
+        if isinstance(editor, QtWidgets.QComboBox) and str(v) in [editor.itemText(i) for i in range(editor.count())]:
+            editor.setCurrentText(str(v))
+        elif isinstance(editor, QtWidgets.QSpinBox):
+            editor.setValue(v)
+
+    def log(self, text):
+        self.log_view.appendPlainText(f"{time.strftime('%H:%M:%S')} {text}")
 
 
 class Viewer(QtWidgets.QWidget):
@@ -104,11 +259,11 @@ class Viewer(QtWidgets.QWidget):
             print(f"app column disabled: {e}")
             self.vc = self.tables = None
 
-        self._build_ui()
-
         self.camera = CameraThread(self.cfg)
         self.camera.frame.connect(self.on_frame)
-        self.camera.gain.connect(self.on_gain)
+        self.camera.streaming.connect(self.on_streaming)
+        self.camera.done.connect(self.on_done)
+        self._build_ui()
         self.camera.start()
 
     # ---- layout --------------------------------------------------------------
@@ -195,7 +350,8 @@ class Viewer(QtWidgets.QWidget):
         ):
             QtGui.QShortcut(QtGui.QKeySequence(key), self, activated=fn)
 
-        layout = QtWidgets.QVBoxLayout(self)
+        view = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(view)
         layout.addWidget(self.images, stretch=4)
         layout.addWidget(self.strip, stretch=1)
         layout.addWidget(self.hist, stretch=2)
@@ -203,7 +359,18 @@ class Viewer(QtWidgets.QWidget):
         layout.addWidget(self.stats)
         layout.addWidget(self.buf_info)
         layout.addWidget(self.readout)
-        self.resize(1300, 1000)
+
+        self.panel = ControlPanel(self.camera)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(self.panel)
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(self.panel.sizeHint().width() + scroll.verticalScrollBar().sizeHint().width() + 4)
+        splitter = QtWidgets.QSplitter()
+        splitter.addWidget(view)
+        splitter.addWidget(scroll)
+        splitter.setSizes([1300, 560])
+        QtWidgets.QHBoxLayout(self).addWidget(splitter)
+        self.resize(1860, 1000)
 
     # ---- camera events -------------------------------------------------------
 
@@ -248,6 +415,9 @@ class Viewer(QtWidgets.QWidget):
                 self.auto_band()
                 self.show_full_range()
         self.update_gain_button()
+
+    def on_streaming(self, mode):
+        self.on_gain(mode, False)
 
     def on_settled(self):
         self.settled = True
@@ -319,10 +489,23 @@ class Viewer(QtWidgets.QWidget):
             self.gain_button.setText(f"Gain: {name} (switch to {other})")
         self.gain_button.setEnabled(self.settled and not self.switching and self.gain_mode is not None)
 
+    def on_done(self, callback, result):
+        callback(result)
+
     def switch_gain(self):
         target = p3.GainMode.LOW if self.gain_mode == p3.GainMode.HIGH else p3.GainMode.HIGH
         self.gain_button.setEnabled(False)
-        self.camera.gain_requests.put(target)
+        self.camera.submit(lambda cam: cam.set_gain_mode(target), lambda _: self.on_gain(target, True))
+        QtCore.QTimer.singleShot(int(SWITCH_WAIT_S * 1000), self.read_gain_after_switch)
+
+    def read_gain_after_switch(self):
+        self.camera.submit(lambda cam: cam.get_gain_mode(), self.on_gain_read)
+
+    def on_gain_read(self, result):
+        if isinstance(result, Exception):
+            self.panel.log(f"gain read after switch: {result}")
+            result = self.gain_mode
+        self.on_gain(result, False)
 
     def auto_band(self):
         if self.th is None:

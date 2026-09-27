@@ -32,8 +32,11 @@ under its own PID. Changes from upstream:
   and `P3Camera.get_gain_mode()` returns the gain. See P3_PROTOCOL.md.
 - `ts2_raw_viewer.py`: the temperature rows as delivered, with a histogram of
   every raw code over the gain's calibrated range and a draggable band that maps
-  to black..white; a gain button; a per-pixel readout of the raw value, the
-  camera's conversion and the value the Vantrue Thermal app would display.
+  to black..white; a ring buffer to step through recent frames; a gain button;
+  a per-pixel readout of the raw value, the camera's conversion and the value
+  the Vantrue Thermal app would display; and a panel for the camera controls
+  in `p3_camera.CONTROLS` (shutter, FFC, auto-FFC and other toggles, noise
+  reduction, NUC-T bypass, freeze) with a raw command console.
 - `vendor_tempcorr.py`: runs the app's native temperature correction under
   Unicorn. P3_PROTOCOL.md describes the app's temperature chain.
 
